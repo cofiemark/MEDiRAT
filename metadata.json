@@ -1,0 +1,5 @@
+{
+  "name": "MEDiRAT® - Medical Equipment Risk Assessment Toolkit",
+  "description": "A web application designed to manage the servicing of medical equipment, track risk assessments using the RPN (Risk Priority Number) method, and notify technicians of upcoming tasks.",
+  "requestFramePermissions": []
+}

@@ -1,0 +1,499 @@
+
+======================================================================
+ Supabase Backend Integration Guide for MEDiRAT®
+======================================================================
+
+This guide provides a comprehensive walkthrough for connecting the MEDiRAT® frontend application to a powerful, scalable backend using Supabase.
+
+---
+## TABLE OF CONTENTS
+---
+1.  **Part 1: Supabase Project Setup**
+    -   Creating your project and getting your API keys.
+
+2.  **Part 2: Database Schema SQL Scripts**
+    -   Creating custom types for enums.
+    -   Creating tables for users, equipment, maintenance, and risk assessments.
+    -   Setting up Row Level Security (RLS) policies for data protection.
+
+3.  **Part 3: Sample Data SQL Scripts**
+    -   SQL INSERT statements to populate your new tables with realistic data.
+
+4.  **Part 4: Frontend Integration Steps**
+    -   Setting up environment variables.
+    -   Installing and configuring the Supabase client.
+    -   Refactoring authentication to use Supabase Auth.
+    -   Fetching and displaying data from the database.
+    -   Mutating data (creating new records).
+
+---
+## Part 1: Supabase Project Setup
+---
+
+1.  **Create a Supabase Account:** Go to [supabase.com](https://supabase.com) and sign up for a free account.
+2.  **Create a New Project:**
+    -   On your dashboard, click "New project".
+    -   Give your project a name (e.g., `medirat-toolkit`).
+    -   Generate a secure database password and save it somewhere safe.
+    -   Choose a region closest to you.
+    -   Click "Create new project" and wait a few minutes for it to be set up.
+3.  **Get Your API Keys:**
+    -   Once your project is ready, navigate to the **Settings** page (the gear icon).
+    -   Go to the **API** section.
+    -   You will find your **Project URL** and your `anon` **public** key. You will need these for the frontend setup. **NEVER** expose the `service_role` key in a client-side application.
+
+---
+## Part 2: Database Schema SQL Scripts
+---
+
+Navigate to the **SQL Editor** in your Supabase dashboard and run the following scripts. It's best to run each `CREATE` statement one by one.
+
+### Step 2.1: Create Custom Types (Enums)
+
+This script creates custom PostgreSQL types to enforce the values of our application's enums at the database level.
+
+```sql
+-- Create a custom type for user roles
+CREATE TYPE public.user_role AS ENUM (
+    'Service Manager',
+    'Technician',
+    'Hospital Staff'
+);
+
+-- Create a custom type for equipment departments
+CREATE TYPE public.department AS ENUM (
+    'Intensive Care Unit',
+    'Emergency Department',
+    'Radiology',
+    'Dental Clinic',
+    'Obstetrics & Gynecology',
+    'Surgical Ward',
+    'Medical Ward',
+    'Laboratory',
+    'Pediatric Ward',
+    'Operation Room',
+    'Outpatient Department',
+    'Dialysis Unit',
+    'Maternity Ward',
+    'Neonatal Intensive Care Unit',
+    'Physiotherapy'
+);
+
+-- Create a custom type for equipment status
+CREATE TYPE public.equipment_status AS ENUM (
+    'Operational',
+    'Needs Maintenance',
+    'Under Maintenance',
+    'Out of Service'
+);
+
+-- Create a custom type for risk levels
+CREATE TYPE public.risk_level AS ENUM (
+    'Negligible',
+    'Low',
+    'Moderate',
+    'High',
+    'Critical',
+    'Severe'
+);
+
+```
+
+### Step 2.2: Create Tables
+
+This script creates the tables for your application. We will use Supabase's built-in `auth.users` table and link it to a public `profiles` table.
+
+```sql
+-- Create a table for public user profiles
+CREATE TABLE public.profiles (
+    id UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL PRIMARY KEY,
+    full_name TEXT,
+    avatar_url TEXT,
+    role public.user_role NOT NULL
+);
+
+-- Create the equipment table
+CREATE TABLE public.equipment (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    name TEXT NOT NULL,
+    model TEXT NOT NULL,
+    serial_number TEXT NOT NULL UNIQUE,
+    department public.department NOT NULL,
+    location TEXT,
+    purchase_date DATE,
+    installation_date DATE NOT NULL,
+    manufacturer TEXT,
+    status public.equipment_status NOT NULL,
+    inventory_code TEXT UNIQUE,
+    maintenance_interval_days INTEGER NOT NULL
+);
+
+-- Create the maintenance logs table
+CREATE TABLE public.maintenance_logs (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    equipment_id UUID REFERENCES public.equipment(id) ON DELETE CASCADE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    date DATE NOT NULL,
+    technician_name TEXT NOT NULL, -- Storing name directly for simplicity
+    work_performed TEXT,
+    parts_used TEXT[],
+    notes TEXT,
+    status_after_service public.equipment_status
+);
+
+-- Create the risk assessments table
+CREATE TABLE public.risk_assessments (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    equipment_id UUID REFERENCES public.equipment(id) ON DELETE CASCADE NOT NULL,
+    assessment_date DATE NOT NULL,
+    likelihood INTEGER NOT NULL CHECK (likelihood BETWEEN 1 AND 5),
+    severity INTEGER NOT NULL CHECK (severity BETWEEN 1 AND 5),
+    detectability INTEGER NOT NULL CHECK (detectability BETWEEN 1 AND 5),
+    rpn INTEGER NOT NULL,
+    risk_level public.risk_level NOT NULL,
+    action_required TEXT
+);
+```
+
+### Step 2.3: Set up Row Level Security (RLS) Policies
+
+RLS is essential for security. These policies define who can access or modify data.
+
+```sql
+-- Enable RLS for all tables
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.equipment ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.maintenance_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.risk_assessments ENABLE ROW LEVEL SECURITY;
+
+-- PROFILES Policies
+CREATE POLICY "Public profiles are viewable by everyone."
+    ON public.profiles FOR SELECT USING (true);
+CREATE POLICY "Users can insert their own profile."
+    ON public.profiles FOR INSERT WITH CHECK (auth.uid() = id);
+CREATE POLICY "Users can update their own profile."
+    ON public.profiles FOR UPDATE USING (auth.uid() = id);
+
+-- EQUIPMENT Policies
+CREATE POLICY "Authenticated users can view all equipment."
+    ON public.equipment FOR SELECT USING (auth.role() = 'authenticated');
+CREATE POLICY "Service Managers can create equipment."
+    ON public.equipment FOR INSERT WITH CHECK (
+        (SELECT role FROM public.profiles WHERE id = auth.uid()) = 'Service Manager'
+    );
+CREATE POLICY "Service Managers and Technicians can update equipment."
+    ON public.equipment FOR UPDATE USING (
+        (SELECT role FROM public.profiles WHERE id = auth.uid()) IN ('Service Manager', 'Technician')
+    );
+
+
+-- LOGS & ASSESSMENTS Policies
+CREATE POLICY "Authenticated users can view logs and assessments."
+    ON public.maintenance_logs FOR SELECT USING (auth.role() = 'authenticated');
+CREATE POLICY "Authenticated users can view logs and assessments."
+    ON public.risk_assessments FOR SELECT USING (auth.role() = 'authenticated');
+
+CREATE POLICY "Service Managers and Technicians can add logs and assessments."
+    ON public.maintenance_logs FOR INSERT WITH CHECK (
+        (SELECT role FROM public.profiles WHERE id = auth.uid()) IN ('Service Manager', 'Technician')
+    );
+CREATE POLICY "Service Managers and Technicians can add logs and assessments."
+    ON public.risk_assessments FOR INSERT WITH CHECK (
+        (SELECT role FROM public.profiles WHERE id = auth.uid()) IN ('Service Manager', 'Technician')
+    );
+```
+
+---
+## Part 3: Sample Data SQL Scripts
+---
+
+Run this script in the **SQL Editor** to populate your database with the same data used in the frontend mock files.
+
+**Important:** Before running this, you need to manually create the three users in Supabase Authentication so their `auth.uid()` values exist.
+1.  Go to **Authentication -> Users** in Supabase.
+2.  Click **"Add user"**. Create three users with the following emails:
+    -   `manager@medirat.com`
+    -   `tech@medirat.com`
+    -   `staff@medirat.com`
+    (You can use simple passwords like `password123` for this demo).
+3.  Go back to the **SQL Editor** and run the following script.
+
+```sql
+-- Insert public profiles linked to the auth users you just created
+INSERT INTO public.profiles (id, full_name, avatar_url, role)
+VALUES
+    ((SELECT id FROM auth.users WHERE email = 'manager@medirat.com'), 'Eng. Mark Cofie', 'https://i.pravatar.cc/150?u=mark.cofie@medirat.com', 'Service Manager'),
+    ((SELECT id FROM auth.users WHERE email = 'tech@medirat.com'), 'John Doe', 'https://i.pravatar.cc/150?u=tech@medirat.com', 'Technician'),
+    ((SELECT id FROM auth.users WHERE email = 'staff@medirat.com'), 'Jane Smith', 'https://i.pravatar.cc/150?u=staff@medirat.com', 'Hospital Staff');
+
+-- Declare variables to hold equipment UUIDs for easier linking
+DO $$
+DECLARE
+    ventilator_id UUID;
+    defib_id UUID;
+    xray_id UUID;
+    dental_chair_id UUID;
+BEGIN
+    -- Insert Equipment and capture their IDs
+    INSERT INTO public.equipment (name, model, serial_number, department, location, purchase_date, installation_date, manufacturer, status, inventory_code, maintenance_interval_days)
+    VALUES
+    ('Ventilator', 'Respira Pro X', 'SN-A12345', 'Intensive Care Unit', 'ICU, Bed 4', NOW() - INTERVAL '730 days', NOW() - INTERVAL '720 days', 'MedTech Inc.', 'Needs Maintenance', 'ICU-VNT-01', 90) RETURNING id INTO ventilator_id;
+
+    INSERT INTO public.equipment (name, model, serial_number, department, location, purchase_date, installation_date, manufacturer, status, inventory_code, maintenance_interval_days)
+    VALUES
+    ('Defibrillator', 'CardioShock 500', 'SN-B67890', 'Emergency Department', 'ER, Crash Cart 1', NOW() - INTERVAL '1095 days', NOW() - INTERVAL '1090 days', 'LifeLine Solutions', 'Operational', 'ER-DEF-01', 180) RETURNING id INTO defib_id;
+
+    INSERT INTO public.equipment (name, model, serial_number, department, location, purchase_date, installation_date, manufacturer, status, inventory_code, maintenance_interval_days)
+    VALUES
+    ('X-ray Machine', 'ImageX 3000', 'SN-C11223', 'Radiology', 'Radiology, Room 2', NOW() - INTERVAL '1825 days', NOW() - INTERVAL '1820 days', 'RayView Technologies', 'Out of Service', 'RAD-XRAY-02', 365) RETURNING id INTO xray_id;
+
+    INSERT INTO public.equipment (name, model, serial_number, department, location, purchase_date, installation_date, manufacturer, status, inventory_code, maintenance_interval_days)
+    VALUES
+    ('Dental Chair', 'ComfortDent Pro', 'SN-D44556', 'Dental Clinic', 'Dental Clinic, Suite 3', NOW() - INTERVAL '365 days', NOW() - INTERVAL '360 days', 'SmileMakers Dental', 'Operational', 'DNT-CHR-03', 180) RETURNING id INTO dental_chair_id;
+
+
+    -- Insert Maintenance Logs linked to the equipment
+    INSERT INTO public.maintenance_logs (equipment_id, date, technician_name, work_performed, parts_used, notes, status_after_service)
+    VALUES
+        (ventilator_id, NOW() - INTERVAL '180 days', 'John Doe', 'Preventive Maintenance', '{"Air Filter"}', 'Routine check, replaced filter.', 'Operational'),
+        (ventilator_id, NOW() - INTERVAL '30 days', 'Jane Smith', 'Calibration', '{}', 'Recalibrated pressure sensors.', 'Operational'),
+        (defib_id, NOW() - INTERVAL '90 days', 'John Doe', 'Battery Replacement', '{"Li-ion Battery Pack"}', 'Replaced battery pack and tested charge cycles.', 'Operational'),
+        (xray_id, NOW() - INTERVAL '2 days', 'System', 'Tube Failure Detected', '{}', 'X-ray tube has failed. Requires immediate replacement.', 'Out of Service');
+
+    -- Insert Risk Assessments linked to the equipment
+    INSERT INTO public.risk_assessments (equipment_id, assessment_date, likelihood, severity, detectability, rpn, risk_level, action_required)
+    VALUES
+        (ventilator_id, NOW() - INTERVAL '5 days', 4, 5, 2, 40, 'Moderate', 'Review alarm system software.'),
+        (defib_id, NOW() - INTERVAL '90 days', 2, 5, 1, 10, 'Negligible', 'Routine monitoring.'),
+        (xray_id, NOW() - INTERVAL '365 days', 5, 4, 1, 20, 'Low', 'Acceptable, but schedule regular preventive maintenance'),
+        (xray_id, NOW() - INTERVAL '2 days', 5, 5, 1, 125, 'Severe', 'Immediate replacement of X-ray tube required.'),
+        (dental_chair_id, NOW() - INTERVAL '10 days', 1, 2, 2, 4, 'Negligible', 'Routine monitoring.');
+
+END $$;
+```
+
+
+---
+## Part 4: Frontend Integration Steps
+---
+
+### Step 4.1: Environment Variables
+
+1.  Create a file named `.env` in the root of your project.
+2.  Add your Supabase URL and Anon Key to this file.
+
+```
+# .env
+
+API_KEY=your_gemini_api_key_here
+SUPABASE_URL=your_supabase_project_url_here
+SUPABASE_ANON_KEY=your_supabase_anon_key_here
+```
+
+### Step 4.2: Install and Configure Supabase Client
+
+1.  **Install Supabase JS library**: Open your terminal and run:
+    `npm install @supabase/supabase-js`
+2.  **Create a Supabase client file**: Create a new file at `src/services/supabaseClient.ts`:
+
+```typescript
+// src/services/supabaseClient.ts
+import { createClient } from '@supabase/supabase-js';
+import type { Database } from '../types/database.types'; // You'll generate this next
+
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+
+if (!supabaseUrl || !supabaseAnonKey) {
+  throw new Error('Supabase URL and Anon Key are required.');
+}
+
+export const supabase = createClient<Database>(supabaseUrl, supabaseAnonKey);
+```
+
+3.  **Generate TypeScript Types from your Database**:
+    -   Install the Supabase CLI: `npm install supabase --save-dev`
+    -   Run the following command to generate types (replace `<project-id>` with your actual Supabase project ID from the URL):
+        `npx supabase gen types typescript --project-id <project-id> > src/types/database.types.ts`
+    -   This gives you full type safety for all your database interactions!
+
+### Step 4.3: Refactor Authentication (`AuthContext.tsx`)
+
+Replace the mock user logic with real Supabase authentication.
+
+```typescript
+// contexts/AuthContext.tsx (Updated)
+import React, { createContext, useState, useEffect, ReactNode, useMemo } from 'react';
+import { supabase } from '../services/supabaseClient';
+import type { User as AppUser } from '../types'; // Renaming to avoid conflict
+import type { AuthChangeEvent, Session, User } from '@supabase/supabase-js';
+
+// ... (keep your AuthContextType, but update it)
+
+export interface AuthContextType {
+  user: AppUser | null;
+  session: Session | null;
+  // login is now handled by Supabase UI or a custom form, not a simple email lookup
+  logout: () -> Promise<void>;
+  hasPermission: (permission: string) => boolean;
+  // ... any other auth-related functions
+}
+
+export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
+  const [user, setUser] = useState<AppUser | null>(null);
+  const [session, setSession] = useState<Session | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const getSession = async () => {
+        const { data: { session } } = await supabase.auth.getSession();
+        setSession(session);
+        if (session) {
+            const { data: profile } = await supabase
+                .from('profiles')
+                .select('*')
+                .eq('id', session.user.id)
+                .single();
+            setUser(profile ? { ...session.user, ...profile } as AppUser : null);
+        }
+        setLoading(false);
+    }
+    getSession();
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      async (_event: AuthChangeEvent, session: Session | null) => {
+        setSession(session);
+        if (session) {
+            const { data: profile } = await supabase
+                .from('profiles')
+                .select('*')
+                .eq('id', session.user.id)
+                .single();
+            // Create a composite user object
+            const appUser: AppUser = {
+                id: session.user.id,
+                email: session.user.email || '',
+                name: profile?.full_name || 'New User',
+                role: profile?.role || 'Hospital Staff',
+                avatarUrl: profile?.avatar_url || '',
+                // In a real app, permissions would come from the role
+                permissions: getPermissionsForRole(profile?.role)
+            };
+            setUser(appUser);
+        } else {
+            setUser(null);
+        }
+      }
+    );
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  const logout = async () => {
+    await supabase.auth.signOut();
+  };
+  
+  // You would define this function based on your app's logic
+  const getPermissionsForRole = (role: string) => {
+    if (role === 'Service Manager') return ['view:dashboard', 'view:equipment', 'add:equipment', 'add:staff', 'acknowledge:notification'];
+    if (role === 'Technician') return ['view:dashboard', 'view:equipment', 'acknowledge:notification'];
+    return ['view:dashboard'];
+  }
+
+  const hasPermission = (permission: string): boolean => {
+    return user?.permissions.includes(permission) ?? false;
+  };
+  
+  // ... other logic like updateUser
+
+  const value = useMemo(() => ({
+    user,
+    session,
+    logout,
+    hasPermission,
+  }), [user, session]);
+
+  return !loading && <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+};
+```
+
+### Step 4.4: Refactor Data Fetching (`App.tsx`)
+
+Finally, replace the mock data with a `useEffect` hook that fetches live data from Supabase.
+
+```typescript
+// App.tsx (Updated)
+
+// ... imports
+import { supabase } from './services/supabaseClient';
+
+// ...
+
+const AppContent: React.FC = () => {
+  const [equipmentList, setEquipmentList] = useState<Equipment[]>([]);
+  const [loading, setLoading] = useState(true);
+  
+  // ... other state variables (currentView, selectedEquipmentId, etc.)
+
+  useEffect(() => {
+    const fetchEquipment = async () => {
+      setLoading(true);
+      // Fetch equipment and all related logs and assessments in one go!
+      const { data, error } = await supabase
+        .from('equipment')
+        .select(`
+          *,
+          maintenance_logs (*),
+          risk_assessments (*)
+        `);
+
+      if (error) {
+        console.error('Error fetching equipment:', error);
+      } else {
+        // Here you would need to map the snake_case columns from Supabase
+        // to camelCase keys for your frontend types.
+        const formattedData = data.map(eq => ({
+            id: eq.id,
+            name: eq.name,
+            model: eq.model,
+            serialNumber: eq.serial_number,
+            department: eq.department,
+            location: eq.location,
+            purchaseDate: new Date(eq.purchase_date),
+            installationDate: new Date(eq.installation_date),
+            manufacturer: eq.manufacturer,
+            status: eq.status,
+            inventoryCode: eq.inventory_code,
+            maintenanceIntervalDays: eq.maintenance_interval_days,
+            maintenanceHistory: eq.maintenance_logs.map(log => ({
+                // ... map log fields
+            })).sort((a,b) => b.date.getTime() - a.date.getTime()),
+            riskAssessments: eq.risk_assessments.map(ra => ({
+                // ... map assessment fields
+            })).sort((a,b) => b.assessmentDate.getTime() - a.assessmentDate.getTime())
+        }));
+        setEquipmentList(formattedData as Equipment[]);
+      }
+      setLoading(false);
+    };
+
+    fetchEquipment();
+  }, []);
+
+  // ... rest of the component logic remains largely the same
+  // but now it operates on live data!
+
+  if (loading) {
+      return <div>Loading...</div> // Add a proper loading spinner
+  }
+
+  // ... return statement with JSX
+}
+
+// ... rest of App.tsx
+```
+
+This guide provides a solid foundation for migrating your application to a Supabase backend. You will need to apply similar patterns for mutating data (e.g., using `supabase.from('equipment').insert(...)` in your `AddNewEquipment` component).
